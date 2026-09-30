@@ -12,6 +12,30 @@ sudo python3 respeaker_led.py spin blue
 sudo python3 respeaker_led.py off
 ```
 
+## 색 고르기 — `led_picker.py`
+
+색과 속도는 숫자로 못 정하고 눈으로 봐야 한다. 브라우저에서 찍으면 LED 가 즉시 바뀐다.
+
+```bash
+sudo ./led_picker.py
+# 이 기기의 브라우저에서 http://127.0.0.1:8777
+```
+
+- 상태(LISTENING/THINKING/...)를 고르면 그 화면이 LED 에 재생된다
+- 견본을 누르거나 색상 선택기·RGB 슬라이더로 색을 바꾸면 바로 반영된다
+- 밝기, 흐름 속도, 파동 속도, 꼬리 길이도 슬라이더로 조절
+- **코드로 내보내기** → `led_controller.py` 에 붙여넣을 상수가 나온다
+
+`LISTENING`/`CAPTURING` 이 한 색을(`C_CYAN`), `MUTE`/`ERROR` 가 한 색을(`C_RED`)
+같이 쓴다. 일부러 그렇게 둔 것이고 화면에도 표시된다.
+
+LED 를 만지려면 root 여야 해서 이 서버도 root 로 돈다. 그래서 **`127.0.0.1` 에만
+묶어** 외부에서 접속할 수 없게 했다. 다루는 것은 색과 속도 값뿐이고 파일을 서빙하거나
+명령을 실행하지 않는다.
+
+내보낸 값을 반영할 때는 `led_test.py` 의 팔레트도 같이 고쳐야 한다 (안 그러면
+드리프트 경고가 뜬다).
+
 ## 음성 어시스턴트 상태 표시 — `led_controller.py`
 
 LED 를 소유하는 전용 스레드에 상태 기계를 얹은 것. 음성 파이프라인은 상태만 던진다.
