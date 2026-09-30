@@ -12,6 +12,82 @@ sudo python3 respeaker_led.py spin blue
 sudo python3 respeaker_led.py off
 ```
 
+## 음성 어시스턴트 상태 표시 — `led_controller.py`
+
+LED 를 소유하는 전용 스레드에 상태 기계를 얹은 것. 음성 파이프라인은 상태만 던진다.
+
+```bash
+sudo ./led_controller.py demo              # 9개 상태를 순서대로 보여준다
+sudo ./led_controller.py thinking          # 한 상태만 계속 유지 (값 고를 때)
+sudo ./led_controller.py thinking --thinking-speed 2.4
+sudo ./led_controller.py speaking --speaking-hz 2.2
+```
+
+```python
+from led_controller import LedController, State
+
+with LedController(brightness=0.45) as led:
+    led.install_signal_handlers()     # SIGTERM/SIGINT 에 소등을 건다
+    led.boot()
+    led.set_phase(State.LISTENING)    # 웨이크워드 감지
+    led.set_level(rms)                # 마이크 크기 0~1, 계속 갱신
+    led.set_phase(State.THINKING)
+    led.set_phase(State.SPEAKING)
+    led.set_muted(True)               # 버튼(pin 11)에 물리기
+    led.error()
+```
+
+### 상태
+
+LED 가 3개뿐이라 **색이 아니라 움직임이 주 신호다.** 방 건너편에서 작은 LED 의 색은
+잘 구분되지 않고 색각 이상이면 더하다. 특히 **정지 = 듣는 중, 움직임 = 처리 중** 이
+둘을 가르는 핵심이고, 색으로만 구분하면 실패한다.
+
+| 상태 | 패턴 | 색 | 종류 |
+|---|---|---|---|
+| `IDLE` | 꺼짐 | — | phase |
+| `LISTENING` | 3개 고정 점등 | 청록 | phase |
+| `CAPTURING` | 중앙 고정 + 바깥이 목소리 크기를 탐 | 청록 | phase |
+| `THINKING` | 꼬리 달린 흐름 | 보라 | phase |
+| `SPEAKING` | 중앙→양쪽 퍼지는 파동 | 따뜻한 흰색 | phase |
+| `BOOT` | 한 번 훑기 | 흰색 | 일회성 |
+| `ACK` | 한 번 플래시 | 초록 | 일회성 |
+| `ERROR` | 2회 점멸 | 빨강 | 일회성 |
+| `MUTE` | 중앙 1개 은은하게 | 빨강 | 플래그 |
+
+`IDLE` 이 꺼짐인 건 의도다. 상시 점등은 밤에 거슬린다.
+
+`MUTE` 는 빼지 마라. 마이크 달린 기기는 마이크가 살아 있는지 사용자가 볼 수 있어야
+한다. 이 보드는 버튼이 이미 있으니 (pin 11 / line 112) `toggle_muted()` 에 물리면 된다.
+
+### 우선순위
+
+LED 3개로 두 상태를 동시에 못 보여준다. 겹치면 높은 쪽이 이긴다:
+
+```
+ERROR > MUTE > BOOT > ACK > SPEAKING > THINKING > CAPTURING > LISTENING > IDLE
+```
+
+`ERROR` 가 `MUTE` 보다 위인 이유: 마이크를 끈 상태일수록 오류를 알아야 하고, 둘 다
+빨강이라 "마이크가 살아 있다" 는 오해를 주지 않는다. 표시가 끝나면 `MUTE` 로 돌아온다.
+`MUTE` 를 덮는 것 중 마이크가 켜진 듯 보이는 상태는 없다.
+
+### 알아둘 것
+
+- **LED 는 상시 떠 있는 단일 프로세스가 소유해야 한다.** gpiod 라인은 한 프로세스만
+  잡을 수 있어서 (EBUSY), 이벤트마다 스크립트를 띄우는 방식은 불가능하다.
+- **비트뱅잉은 블로킹이다.** 그래서 전용 스레드다. 음성 파이프라인과 같은 스레드에서
+  돌리면 인식이 끊긴다.
+- **그리기 스레드가 죽으면 LED 가 마지막 프레임으로 얼어붙는다.** 예외를 잡아
+  `led.failure` 로 알리니, 긴 루프를 도는 쪽에서 가끔 확인해라.
+- **종료 시 소등이 필수다.** APA102 는 리셋이 없어 안 끄고 죽으면 색이 굳는다.
+  `install_signal_handlers()` / `with` / `atexit` 세 겹으로 걸어뒀다.
+- **CPU**: 애니메이션 중 한 코어의 12% (50fps). 정지 화면은 동일 프레임 전송을
+  생략해서 0.4%. 부담되면 `fps=30` 으로 낮춰라 (약 7%).
+- **밝기**: 전역 밝기(5비트)는 31 로 고정하고 dimming 은 RGB 로 한다. 전역 밝기
+  필드는 색 PWM 보다 훨씬 낮은 주파수라 낮은 값에서 깜빡임이 보일 수 있다.
+  밤에는 `brightness=0.05` 정도.
+
 ## 다른 장비 검수 — `led_test.py`
 
 같은 Jetson Orin Nano + 같은 HAT 을 여러 대 검수할 때 쓴다.
