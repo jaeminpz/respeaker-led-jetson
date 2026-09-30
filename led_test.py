@@ -6,8 +6,13 @@
     scp led_test.py <장비>:~/
     ssh <장비> 'chmod +x led_test.py && sudo ./led_test.py'
 
-한 번 실행하면 환경 점검 → 색 순서대로 표시 → PASS/FAIL 을 찍고 끝난다.
+한 번 실행하면 환경 점검 → 실제 상태 표시를 순서대로 보여주고 PASS/FAIL 을 찍는다.
 종료 코드는 PASS 0 / FAIL 1 이라 다른 검수 스크립트에 물려 쓸 수 있다.
+
+색은 led_controller.py 가 실제로 쓰는 팔레트 그대로다. 임의의 빨강/초록/파랑이
+아니라 현장에서 보게 될 화면으로 검수하기 위해서다. 다만 죽은 색 채널을 확실히
+잡으려고 맨 앞에 R/G/B 단독 점검을 짧게 넣었다 (팔레트만으로는 한 채널이 죽어도
+다른 색에 묻혀 안 보일 수 있다).
 
 자동으로 잡히는 것과 못 잡는 것
 -------------------------------
@@ -17,9 +22,16 @@
 
 다만 LED 소자 자체가 죽었거나 납땜이 떨어진 경우는 소프트웨어로 알 수 없다.
 색이 눈에 보였는지는 사람이 봐야 한다 (`--confirm` 을 주면 마지막에 물어본다).
+
+팔레트 동기화
+-------------
+이 파일은 한 파일로 배포되어야 하므로 led_controller.py 의 팔레트와 애니메이션을
+복사해서 갖고 있다. 저장소 전체가 있는 환경에서는 실행할 때 두 구현의 출력을
+비교해서 어긋났으면 경고한다 (한 파일만 있는 장비에서는 조용히 건너뛴다).
 """
 
 import argparse
+import math
 import mmap
 import os
 import struct
@@ -43,12 +55,21 @@ NUM_LED = 3
 LED_PREFIX = 0xE0          # 0b111xxxxx, 하위 5비트 = global brightness
 MAX_BRIGHTNESS = 31
 
-RED = (255, 0, 0)
-GREEN = (0, 255, 0)
-BLUE = (0, 0, 255)
-WHITE = (255, 255, 255)
-CYAN = (0, 255, 255)
-OFF = (0, 0, 0)
+# --- 팔레트: led_controller.py 와 같아야 한다 ---------------------------------
+C_CYAN = (0.00, 0.70, 1.00)     # 듣는 중
+C_PURPLE = (0.60, 0.00, 1.00)   # 생각 중
+C_WARM = (1.00, 0.66, 0.31)     # 말하는 중
+C_RED = (1.00, 0.00, 0.00)      # 오류 / 마이크 꺼짐
+C_GREEN = (0.00, 1.00, 0.24)    # 확인
+C_WHITE = (1.00, 1.00, 1.00)    # 기동
+
+THINKING_SPEED = 3.2
+THINKING_TAIL = 1.35
+SPEAKING_HZ = 1.6
+SPEAKING_SPREAD = 0.30
+MUTE_LEVEL = 0.12
+
+OFF3 = [(0.0, 0.0, 0.0)] * NUM_LED
 
 
 # --- 출력 -------------------------------------------------------------------
@@ -62,11 +83,11 @@ C_BAD = "\033[31m" if _tty() else ""
 C_DIM = "\033[2m" if _tty() else ""
 C_END = "\033[0m" if _tty() else ""
 
-TOTAL_STEPS = 6
+TOTAL_STEPS = 8
 
 
 def step(n, label):
-    print(f"[{n}/{TOTAL_STEPS}] {label} ".ljust(34, "."), end=" ", flush=True)
+    print(f"[{n}/{TOTAL_STEPS}] {label} ".ljust(38, "."), end=" ", flush=True)
 
 
 def ok(msg="OK"):
@@ -145,7 +166,7 @@ def _open_lines(chip_name, consumer):
     except OSError as e:
         # EBUSY = 다른 프로세스가 이미 이 라인을 잡고 있다
         raise Fail(f"gpio 라인 {LINE_CLK}/{LINE_DATA} 요청 실패: {e}",
-                   "다른 LED 프로세스가 떠 있는지 확인: "
+                   "다른 LED 프로세스(led_controller 등)가 떠 있는지 확인: "
                    "sudo gpioinfo gpiochip0 | grep -E 'line +(133|135)'")
 
 
@@ -190,27 +211,138 @@ def _check_pad(name, val):
     return problems
 
 
+# --- 색 계산 (led_controller.py 와 동일해야 한다) -----------------------------
+
+def _clamp01(x):
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _dim(color, k):
+    k = _clamp01(k)
+    return (color[0] * k, color[1] * k, color[2] * k)
+
+
+def _bump(e, phase):
+    return (0.5 * (1.0 + math.cos(2.0 * math.pi * (e - phase)))) ** 3
+
+
+def a_listening(t, level):
+    return [_dim(C_CYAN, 0.75)] * NUM_LED
+
+
+def a_capturing(t, level):
+    center = 0.30 + 0.70 * level
+    outer = 0.05 + 0.95 * _clamp01((level - 0.12) / 0.88)
+    return [_dim(C_CYAN, outer), _dim(C_CYAN, center), _dim(C_CYAN, outer)]
+
+
+def a_thinking(t, level):
+    head = (t * THINKING_SPEED) % NUM_LED
+    out = []
+    for i in range(NUM_LED):
+        d = abs(i - head)
+        d = min(d, NUM_LED - d)
+        # max() 를 먼저. 음수의 실수 거듭제곱은 예외가 아니라 복소수를 낸다.
+        out.append(_dim(C_PURPLE, max(0.0, 1.0 - d / THINKING_TAIL) ** 1.5))
+    return out
+
+
+def a_speaking(t, level):
+    e = (t * SPEAKING_HZ) % 1.0
+    amp = 0.35 + 0.65 * level
+    center = (0.25 + 0.75 * _bump(e, 0.0)) * amp
+    outer = (0.25 + 0.75 * _bump(e, SPEAKING_SPREAD)) * amp
+    return [_dim(C_WARM, outer), _dim(C_WARM, center), _dim(C_WARM, outer)]
+
+
+def a_mute(t, level):
+    return [(0.0, 0.0, 0.0), _dim(C_RED, MUTE_LEVEL), (0.0, 0.0, 0.0)]
+
+
+def a_boot(t, level):
+    head = t * 4.0
+    return [_dim(C_WHITE, 1.0 - abs(i - head) * 1.6) for i in range(NUM_LED)]
+
+
+def a_ack(t, level):
+    return [_dim(C_GREEN, math.sin(math.pi * _clamp01(t / 0.35)))] * NUM_LED
+
+
+def a_error(t, level):
+    on = t < 0.60 and int(t / 0.15) % 2 == 0
+    return [C_RED] * NUM_LED if on else OFF3
+
+
+#: 이름 -> (그리기 함수, led_controller 의 State 이름)
+SHARED_ANIMS = {
+    "listening": (a_listening, "LISTENING"),
+    "capturing": (a_capturing, "CAPTURING"),
+    "thinking": (a_thinking, "THINKING"),
+    "speaking": (a_speaking, "SPEAKING"),
+    "mute": (a_mute, "MUTE"),
+    "boot": (a_boot, "BOOT"),
+    "ack": (a_ack, "ACK"),
+    "error": (a_error, "ERROR"),
+}
+
+
+def _palette_drift():
+    """led_controller 가 옆에 있으면 두 구현이 같은 그림을 그리는지 비교한다.
+
+    한 파일만 배포된 장비에서는 import 가 실패하므로 조용히 건너뛴다.
+    """
+    try:
+        import led_controller as LC
+    except Exception:
+        return []
+
+    drift = []
+    for name, (fn, state_name) in SHARED_ANIMS.items():
+        ref = LC.ANIMATIONS.get(getattr(LC.State, state_name, None))
+        if ref is None:
+            drift.append(f"{name}: led_controller 에 {state_name} 이 없다")
+            continue
+        for i in range(400):
+            t = i * 0.005
+            for lv in (0.0, 0.5, 1.0):
+                mine, theirs = fn(t, lv), ref(t, lv)
+                if any(abs(a - b) > 1e-9
+                       for pa, pb in zip(mine, theirs)
+                       for a, b in zip(pa, pb)):
+                    drift.append(
+                        f"{name}: led_controller 와 다른 그림 (t={t:.3f}, level={lv})")
+                    break
+            else:
+                continue
+            break
+    return drift
+
+
 # --- APA102 -------------------------------------------------------------------
 
 class Leds:
-    def __init__(self, brightness=8, chip="gpiochip0"):
-        self.brightness = max(0, min(MAX_BRIGHTNESS, brightness))
-        self._buf = [LED_PREFIX, 0, 0, 0] * NUM_LED
+    """전역 밝기는 31 로 고정하고 dimming 은 RGB 로 한다 (깜빡임 방지)."""
+
+    def __init__(self, brightness=0.45, chip="gpiochip0"):
+        self.master = _clamp01(brightness)
+        self._buf = [LED_PREFIX | MAX_BRIGHTNESS, 0, 0, 0] * NUM_LED
         self._lines = _open_lines(chip, "led-test")
         self.api = self._lines.api
         # 순서 중요: 라인 요청이 GPIO_SF_SEL 을 다시 1로 만들기 때문에 그 뒤에 고친다
         self.pad_sck = _fix_pad(OFF_SCK)
         self.pad_mosi = _fix_pad(OFF_MOSI)
-        self.solid(OFF, 0)
+        self.draw(OFF3)
 
-    def set_pixel(self, index, r, g, b, brightness=None):
-        br = self.brightness if brightness is None else brightness
-        base = index * 4
-        # APA102 는 프레임당 [0xE0|밝기, B, G, R] 순서로 받는다
-        self._buf[base] = LED_PREFIX | (max(0, min(MAX_BRIGHTNESS, br)) & 0x1F)
-        self._buf[base + 1] = b & 0xFF
-        self._buf[base + 2] = g & 0xFF
-        self._buf[base + 3] = r & 0xFF
+    def draw(self, colors):
+        """0~1 실수 RGB 3개를 그린다."""
+        k = self.master * 255.0
+        for i, (r, g, b) in enumerate(colors):
+            base = i * 4
+            # APA102 는 프레임당 [0xE0|밝기, B, G, R] 순서로 받는다
+            self._buf[base + 1] = int(_clamp01(b) * k + 0.5)
+            self._buf[base + 2] = int(_clamp01(g) * k + 0.5)
+            self._buf[base + 3] = int(_clamp01(r) * k + 0.5)
+        self.show()
 
     def show(self):
         data = [0x00] * 4 + self._buf + [0xFF] * 4   # start frame, 픽셀, end frame
@@ -222,22 +354,33 @@ class Leds:
                 sv([1, bit])      # 상승 에지에 APA102 가 샘플링
         sv([0, 0])
 
-    def solid(self, color, brightness=None):
-        for i in range(NUM_LED):
-            self.set_pixel(i, *color, brightness=brightness)
-        self.show()
-
-    def one(self, index, color, brightness=None):
-        for i in range(NUM_LED):
-            self.set_pixel(i, *(color if i == index else OFF),
-                           brightness=brightness)
-        self.show()
+    def animate(self, fn, duration, level_fn=None, fps=50):
+        """fn(t, level) 을 duration 초 동안 돌린다."""
+        t0 = time.perf_counter()
+        period = 1.0 / fps
+        while True:
+            t = time.perf_counter() - t0
+            if t >= duration:
+                break
+            self.draw(fn(t, level_fn(t) if level_fn else 0.0))
+            time.sleep(max(0.0, period - (time.perf_counter() - t0 - t)))
 
     def close(self):
         try:
-            self.solid(OFF, 0)
+            self.draw(OFF3)
         finally:
             self._lines.release()
+
+
+def _fake_level(t, speaking=False):
+    """말소리 비슷한 크기 곡선. CAPTURING/SPEAKING 을 살아 있게 보이려고 쓴다."""
+    if speaking:
+        v = 0.55 + 0.45 * math.sin(2 * math.pi * 1.1 * t)
+        v *= 0.7 + 0.3 * math.sin(2 * math.pi * 0.37 * t + 1.0)
+        return _clamp01(v)
+    v = 0.5 + 0.5 * math.sin(2 * math.pi * 0.8 * t)
+    v *= 0.5 + 0.5 * math.sin(2 * math.pi * 0.23 * t)
+    return _clamp01(v ** 0.7)
 
 
 # --- 검수 본체 -----------------------------------------------------------------
@@ -245,55 +388,71 @@ class Leds:
 def run(args):
     warnings = []
 
-    # [1/6] 환경 점검 — root / gpiod / chip / /dev/mem / padctl 되읽기
+    # [1] 환경 점검 — root / gpiod / chip / /dev/mem / padctl 되읽기
     step(1, "환경 점검")
     if os.geteuid() != 0:
         raise Fail("root 권한이 아니다 (/dev/mem 으로 padctl 을 고쳐야 한다)",
                    f"sudo {os.path.basename(sys.argv[0])} 로 실행")
     if not os.path.exists(f"/dev/{args.chip}"):
-        raise Fail(f"/dev/{args.chip} 가 없다",
-                   "ls /dev/gpiochip* 로 확인")
+        raise Fail(f"/dev/{args.chip} 가 없다", "ls /dev/gpiochip* 로 확인")
+
+    drift = _palette_drift()
 
     leds = Leds(brightness=args.brightness, chip=args.chip)
     try:
         problems = (_check_pad("pin23/SCK (spi1_sck_pz3)", leds.pad_sck)
                     + _check_pad("pin19/DATA (spi1_mosi_pz5)", leds.pad_mosi))
         if problems:
-            raise Fail("padctl 이 LED 동작 상태로 안 잡혔다",
-                       " / ".join(problems))
+            raise Fail("padctl 이 LED 동작 상태로 안 잡혔다", " / ".join(problems))
         ok()
         note(f"{leds.api}, padctl sck=0x{leds.pad_sck:08X} "
-             f"mosi=0x{leds.pad_mosi:08X}, 밝기 {leds.brightness}/31")
+             f"mosi=0x{leds.pad_mosi:08X}, 밝기 {leds.master:.2f}")
+        for d in drift:
+            warnings.append(f"팔레트 어긋남 — {d}")
 
-        # [2..4] 단색 — 3개가 모두 같은 색으로 켜져야 한다
-        for n, (label, color) in enumerate(
-                (("RED", RED), ("GREEN", GREEN), ("BLUE", BLUE)), start=2):
-            step(n, f"{label:<5} ({args.hold:g}s)")
-            leds.solid(color)
-            time.sleep(args.hold)
-            ok()
+        hold, short = args.hold, args.hold * 0.4
 
-        # [5] spin — 한 칸씩 도는 표시. 개별 LED 가 따로 제어되는지 본다
-        step(5, "spin  (LED 개별 확인)")
-        for _ in range(args.revolutions):
-            for i in range(NUM_LED):
-                leds.one(i, CYAN)
-                time.sleep(args.delay)
+        # [2] 채널 점검 — 팔레트만으로는 죽은 채널이 다른 색에 묻힐 수 있다
+        step(2, "채널 점검 (R/G/B 단독)")
+        for color in ((1.0, 0, 0), (0, 1.0, 0), (0, 0, 1.0)):
+            leds.draw([color] * NUM_LED)
+            time.sleep(short)
+        leds.draw(OFF3)
         ok()
 
-        # [6] blink — 전체 on/off 전환
-        step(6, "blink (전체 점멸)")
-        for _ in range(3):
-            leds.solid(WHITE)
-            time.sleep(args.delay * 2)
-            leds.solid(OFF, 0)
-            time.sleep(args.delay * 2)
+        # [3..8] 실제로 쓰는 화면 그대로
+        step(3, "LISTENING  청록 고정")
+        leds.animate(a_listening, hold)
+        ok()
+
+        step(4, "CAPTURING  청록 + 음성 크기")
+        leds.animate(a_capturing, hold, level_fn=_fake_level)
+        ok()
+
+        step(5, "THINKING   보라 흐름")
+        leds.animate(a_thinking, hold)
+        ok()
+
+        step(6, "SPEAKING   따뜻한 흰색 파동")
+        leds.animate(a_speaking, hold,
+                     level_fn=lambda t: _fake_level(t, speaking=True))
+        ok()
+
+        step(7, "MUTE       중앙 빨강 은은하게")
+        leds.animate(a_mute, hold)
+        ok()
+
+        step(8, "일회성     BOOT / ACK / ERROR")
+        for fn, dur in ((a_boot, 0.90), (a_ack, 0.35), (a_error, 0.90)):
+            leds.animate(fn, dur)
+            leds.draw(OFF3)
+            time.sleep(0.45)
         ok()
 
         # 마지막 프레임 속도 — 크게 느려졌으면 뭔가 이상한 것
         t0 = time.perf_counter()
         for _ in range(20):
-            leds.solid(OFF, 0)
+            leds.draw(OFF3)
         ms = (time.perf_counter() - t0) / 20 * 1000
         if ms > 20:
             warnings.append(f"프레임 전송이 느리다 ({ms:.1f} ms/frame, 보통 ~2 ms)")
@@ -301,8 +460,8 @@ def run(args):
         if args.confirm:
             print()
             try:
-                answer = input("  빨강/초록/파랑/회전/점멸이 LED 3개에서 "
-                               "모두 보였나? [y/N] ").strip().lower()
+                answer = input("  위 화면이 LED 3개에서 모두 제대로 보였나? "
+                               "[y/N] ").strip().lower()
             except EOFError:
                 raise Fail("육안 확인 입력을 받지 못했다 (stdin 이 닫혀 있다)",
                            "--confirm 은 대화형 터미널에서만 쓸 수 있다")
@@ -317,24 +476,26 @@ def run(args):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="ReSpeaker 2-Mics Pi HAT v2.0 LED 검수 (root 필요)")
-    ap.add_argument("-b", "--brightness", type=int, default=12,
-                    help="0~31 (기본 12)")
+        description="ReSpeaker 2-Mics Pi HAT v2.0 LED 검수 (root 필요). "
+                    "led_controller.py 가 실제로 쓰는 색으로 보여준다.")
+    ap.add_argument("-b", "--brightness", type=float, default=0.45,
+                    help="0~1 (기본 0.45). 밤에는 0.05 정도")
     ap.add_argument("-t", "--hold", type=float, default=3.0,
-                    help="단색 하나를 유지할 초 (기본 3)")
-    ap.add_argument("-d", "--delay", type=float, default=0.2,
-                    help="spin/blink 한 칸 간격 초 (기본 0.2)")
-    ap.add_argument("-r", "--revolutions", type=int, default=3,
-                    help="spin 바퀴 수 (기본 3)")
+                    help="상태 하나를 유지할 초 (기본 3)")
     ap.add_argument("--fast", action="store_true",
-                    help="짧게: hold 0.6s, delay 0.08s, spin 2바퀴")
+                    help="짧게: 상태당 1초")
     ap.add_argument("--confirm", action="store_true",
                     help="마지막에 육안 확인 y/n 을 물어본다")
     ap.add_argument("--chip", default="gpiochip0", help="기본 gpiochip0")
     args = ap.parse_args()
 
     if args.fast:
-        args.hold, args.delay, args.revolutions = 0.6, 0.08, 2
+        args.hold = 1.0
+    if args.brightness > 1.0:
+        # 예전 판은 0~31 정수였다. 그 습관으로 들어온 값을 받아준다.
+        note(f"밝기 {args.brightness:g} 를 0~1 기준 "
+             f"{args.brightness / MAX_BRIGHTNESS:.2f} 로 해석한다")
+        args.brightness = args.brightness / MAX_BRIGHTNESS
 
     print("ReSpeaker 2-Mics Pi HAT v2.0 — LED 검수")
     print(f"{C_DIM}pin19=DATA(line {LINE_DATA})  pin23=CLK(line {LINE_CLK})  "
