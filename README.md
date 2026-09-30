@@ -15,12 +15,25 @@ sudo python3 respeaker_led.py off
 ## 다른 장비 검수 — `led_test.py`
 
 같은 Jetson Orin Nano + 같은 HAT 을 여러 대 검수할 때 쓴다.
-**이 파일 하나만** 복사하면 된다 (`respeaker_led.py` 불필요, 의존은 `python3-gpiod` 뿐):
+**이 파일 하나만** 있으면 된다 (`respeaker_led.py` 불필요, 의존은 `python3-gpiod` 뿐).
+
+대상 장비에서 받는 법 — 셋 중 아무거나:
 
 ```bash
+# 1) 저장소를 통째로 clone (실행 권한이 보존돼 바로 실행된다)
+git clone https://github.com/jaeminpz/respeaker-led-jetson.git
+cd respeaker-led-jetson && sudo ./led_test.py
+
+# 2) 검수 스크립트 한 파일만 (raw 는 실행 권한이 안 따라오므로 python3 로 실행)
+curl -fsSLO https://raw.githubusercontent.com/jaeminpz/respeaker-led-jetson/main/led_test.py
+sudo python3 led_test.py
+
+# 3) 이 장비에서 직접 복사
 scp led_test.py <장비>:~/
-ssh <장비> 'chmod +x led_test.py && sudo ./led_test.py'
+ssh <장비> 'sudo python3 led_test.py'
 ```
+
+`python3-gpiod` 가 없으면 `sudo apt install python3-libgpiod` 로 넣는다.
 
 ```
 [1/6] 환경 점검 ...................... OK
